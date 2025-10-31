@@ -1,0 +1,122 @@
+import cv2
+import mediapipe as mp
+import time
+import keyboard
+from CodingRider.drone import *
+from CodingRider.protocol import *
+
+# -----------------------------
+# 기본 설정
+# -----------------------------
+is_takeoff = False
+drone = Drone()
+drone.open('COM4')
+
+capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+capture.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 버퍼 최소화 → 지연 개선
+
+mp_face_detection = mp.solutions.face_detection
+mp_drawing = mp.solutions.drawing_utils
+
+# 최근 인식된 얼굴 유지 시간 (초)
+FACE_HOLD_TIME = 0.5
+last_detection_time = 0
+last_nose = None
+
+# -----------------------------
+# Mediapipe Face Detection 시작
+# -----------------------------
+with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.55) as face_detection:
+    while capture.isOpened():
+        ret, frame = capture.read()
+        if not ret:
+            continue
+
+        frame = cv2.flip(frame, 1)
+        frame = cv2.convertScaleAbs(frame, alpha=1.15, beta=25)  # 약간의 밝기/대비 보정
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        results = face_detection.process(rgb_frame)
+
+        # -----------------------------
+        # 얼굴 검출
+        # -----------------------------
+        nose_position = None
+        if results.detections:
+            # 1️⃣ 신뢰도 높은 얼굴만 필터
+            valid_faces = [d for d in results.detections if d.score[0] > 0.6]
+            if valid_faces:
+                # 2️⃣ 여러 얼굴 중 가장 큰 얼굴(가까운 사람) 선택
+                h, w, _ = frame.shape
+                def box_size(det):
+                    box = det.location_data.relative_bounding_box
+                    return box.width * box.height
+                main_face = max(valid_faces, key=box_size)
+
+                keypoints = main_face.location_data.relative_keypoints
+                nose = keypoints[2]
+                nose_position = (int(nose.x * w), int(nose.y * h))
+
+                # 지속 검증 (손이나 일시적 오검출 방지)
+                now = time.time()  # ✅ 수정됨
+                if last_nose and (now - last_detection_time < FACE_HOLD_TIME):
+                    dist = ((nose_position[0] - last_nose[0]) ** 2 +
+                            (nose_position[1] - last_nose[1]) ** 2) ** 0.5
+                    if dist < 200:
+                        last_nose = nose_position
+                        last_detection_time = now
+                else:
+                    last_nose = nose_position
+                    last_detection_time = now
+
+                cv2.circle(frame, last_nose, 50, (0, 0, 255), 10, cv2.LINE_AA)
+        else:
+            if time.time() - last_detection_time < FACE_HOLD_TIME:  # ✅ 수정됨
+                nose_position = last_nose
+
+        # -----------------------------
+        # 키보드 제어
+        # -----------------------------
+        if keyboard.is_pressed('enter') and not is_takeoff:
+            print('이륙 중...')
+            time.sleep(1)
+            drone.sendTakeOff()
+            time.sleep(4)
+            print('이륙 완료')
+            is_takeoff = True
+
+        if keyboard.is_pressed('space') and is_takeoff:
+            print('착륙 중...')
+            drone.sendControlWhile(0, 0, 0, 0, 500)
+            drone.sendLanding()
+            time.sleep(3)
+            print('착륙 완료')
+            is_takeoff = False
+
+        if keyboard.is_pressed('q'):
+            print('정지')
+            drone.sendControlWhile(0, 0, 0, 0, 500)
+            drone.sendStop()
+            time.sleep(2)
+            is_takeoff = False
+
+        # -----------------------------
+        # 드론 제어 (이륙 상태일 때만)
+        # -----------------------------
+        if is_takeoff and last_nose:
+            nx = last_nose[0] / w
+            ny = last_nose[1] / h
+            roll = int(((nx * 200) - 100) * 0.5)
+            pitch = -int(((ny * 200) - 100) * 0.5)
+            drone.sendControl(roll, pitch, 0, 0)
+            cv2.putText(frame, f'r:{roll}, p:{pitch}', (10, 30),
+                        cv2.FONT_HERSHEY_DUPLEX, 1, (255, 0, 0), 2)
+
+        cv2.imshow('Drone Face Control', frame)
+        if cv2.waitKey(1) == 27:  # ESC
+            break
+
+capture.release()
+cv2.destroyAllWindows()
